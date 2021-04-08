@@ -1986,6 +1986,54 @@ final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull[F,
     * res0: Unit = ()
     * }}}
     */
+  def oldParEvalMap[F2[x] >: F[x], O2](
+      maxConcurrent: Int
+  )(f: O => F2[O2])(implicit F: Concurrent[F2]): Stream[F2, O2] = {
+    val fstream: F2[Stream[F2, O2]] = for {
+      chan <- Channel.bounded[F2, F2[Either[Throwable, O2]]](maxConcurrent)
+      chanReadDone <- F.deferred[Unit]
+    } yield {
+      def forkOnElem(o: O): F2[Stream[F2, Unit]] =
+        for {
+          value <- F.deferred[Either[Throwable, O2]]
+          send = chan.send(value.get).as {
+            Stream.eval(f(o).attempt.flatMap(value.complete(_).void))
+          }
+          eit <- chanReadDone.get.race(send)
+        } yield eit match {
+          case Left(())      => Stream.empty
+          case Right(stream) => stream
+        }
+
+      val background = this
+        .evalMap(forkOnElem)
+        .parJoin(maxConcurrent)
+        .onFinalize(chanReadDone.get.race(chan.close).void)
+
+      val foreground =
+        chan.stream
+          .evalMap(identity)
+          .rethrow
+          .onFinalize(chanReadDone.complete(()).void)
+
+      foreground.concurrently(background)
+    }
+    Stream.eval(fstream).flatten
+  }
+
+  /** Like [[Stream#evalMap]], but will evaluate effects in parallel, emitting the results
+    * downstream in the same order as the input stream. The number of concurrent effects
+    * is limited by the `maxConcurrent` parameter.
+    *
+    * See [[Stream#parEvalMapUnordered]] if there is no requirement to retain the order of
+    * the original stream.
+    *
+    * @example {{{
+    * scala> import cats.effect.IO, cats.effect.unsafe.implicits.global
+    * scala> Stream(1,2,3,4).covary[IO].parEvalMap(2)(i => IO(println(i))).compile.drain.unsafeRunSync()
+    * res0: Unit = ()
+    * }}}
+    */
   def parEvalMap[F2[x] >: F[x], O2](
       maxConcurrent: Int
   )(f: O => F2[O2])(implicit F: Concurrent[F2]): Stream[F2, O2] = {
